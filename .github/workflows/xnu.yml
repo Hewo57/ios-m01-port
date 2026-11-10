@@ -122,3 +122,4 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+# force workflow detection
