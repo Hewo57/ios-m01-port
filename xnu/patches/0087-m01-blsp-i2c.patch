@@ -1,0 +1,291 @@
+diff --git a/bsd/dev/blsp_i2c.c b/bsd/dev/blsp_i2c.c
+new file mode 100644
+index 0000000..abcdef1
+--- /dev/null
++++ b/bsd/dev/blsp_i2c.c
+@@ -0,0 +1,450 @@
++/*
++ * BLSP I2C controller driver for Qualcomm SDM439 (M01).
++ * Minimal polled implementation for touch controller.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/device.h>
++#include <sys/bus.h>
++#include <machine/bus.h>
++#include <arm64/armreg.h>
++
++/* BLSP I2C register offsets */
++#define BLSP_I2C_CONFIG		0x000
++#define BLSP_I2C_MAIN_CMD		0x004
++#define BLSP_I2C_M_CMD		0x008
++#define BLSP_I2C_M_IRQ_CLR		0x00c
++#define BLSP_I2C_M_IRQ_EN		0x010
++#define BLSP_I2C_M_IRQ_STATUS		0x014
++#define BLSP_I2C_M_CMD_STATUS		0x018
++#define BLSP_I2C_M_GENI_STATUS		0x01c
++#define BLSP_I2C_M_INPUT_CUR		0x020
++#define BLSP_I2C_M_OUTPUT_CUR		0x024
++#define BLSP_I2C_M_INPUT_REM		0x028
++#define BLSP_I2C_M_OUTPUT_REM		0x02c
++#define BLSP_I2C_M_RX_FIFO		0x030
++#define BLSP_I2C_M_TX_FIFO		0x030
++#define BLSP_I2C_M_DMA_CMD		0x034
++#define BLSP_I2C_M_DMA_CONFIG		0x038
++#define BLSP_I2C_M_RX_LAST		0x03c
++#define BLSP_I2C_M_TX_LAST		0x040
++#define BLSP_I2C_M_DMA_IRQ_EN		0x044
++#define BLSP_I2C_M_DMA_IRQ_CLR		0x048
++#define BLSP_I2C_M_DMA_IRQ_STATUS	0x04c
++
++#define BLSP_I2C_CONFIG_MASTER		(1 << 0)
++#define BLSP_I2C_CONFIG_SLAVE		(1 << 1)
++#define BLSP_I2C_CONFIG_I2C		(1 << 2)
++#define BLSP_I2C_CONFIG_SPI		(1 << 3)
++
++#define BLSP_I2C_MAIN_CMD_RESET		(1 << 0)
++#define BLSP_I2C_MAIN_CMD_ENABLE	(1 << 1)
++#define BLSP_I2C_MAIN_CMD_DISABLE	(1 << 2)
++
++#define BLSP_I2C_M_CMD_START		(1 << 0)
++#define BLSP_I2C_M_CMD_STOP		(1 << 1)
++#define BLSP_I2C_M_CMD_READ		(1 << 2)
++#define BLSP_I2C_M_CMD_WRITE		(1 << 3)
++#define BLSP_I2C_M_CMD_RESTART		(1 << 4)
++#define BLSP_I2C_M_CMD_NACK		(1 << 5)
++#define BLSP_I2C_M_CMD_RCV_MATCH	(1 << 6)
++
++#define BLSP_I2C_M_CMD_STATUS_DONE	(1 << 0)
++#define BLSP_I2C_M_CMD_STATUS_ERR	(1 << 1)
++#define BLSP_I2C_M_CMD_STATUS_NACK	(1 << 2)
++#define BLSP_I2C_M_CMD_STATUS_ARB_LOST	(1 << 3)
++
++#define BLSP_I2C_M_IRQ_CMD_DONE		(1 << 0)
++#define BLSP_I2C_M_IRQ_RX_FIFO		(1 << 1)
++#define BLSP_I2C_M_IRQ_TX_FIFO		(1 << 2)
++#define BLSP_I2C_M_IRQ_NACK		(1 << 3)
++#define BLSP_I2C_M_IRQ_ARB_LOST		(1 << 4)
++#define BLSP_I2C_M_IRQ_BUS_ERR		(1 << 5)
++
++#define BLSP_I2C_M_GENI_STATUS_BUSY	(1 << 0)
++#define BLSP_I2C_M_GENI_STATUS_RX_FIFO_EMPTY	(1 << 1)
++#define BLSP_I2C_M_GENI_STATUS_TX_FIFO_FULL	(1 << 2)
++#define BLSP_I2C_M_GENI_STATUS_RX_FIFO_FULL	(1 << 3)
++#define BLSP_I2C_M_GENI_STATUS_TX_FIFO_EMPTY	(1 << 4)
++
++#define M01_BLSP1_I2C_BASE		0x078B6000
++#define M01_BLSP_I2C_SIZE		0x10000
++#define BLSP_I2C_CLK_HZ		100000
++
++struct blsp_i2c_softc {
++	device_t sc_dev;
++	bus_space_tag_t sc_bustag;
++	bus_space_handle_t sc_bushandle;
++	uint32_t sc_base;
++	uint32_t sc_clk_hz;
++	bool sc_initialized;
++};
++
++static struct blsp_i2c_softc *blsp_i2c_sc = NULL;
++
++static inline uint32_t
++blsp_i2c_read(struct blsp_i2c_softc *sc, bus_size_t off)
++{
++	return bus_space_read_4(sc->sc_bustag, sc->sc_bushandle, off);
++}
++
++static inline void
++blsp_i2c_write(struct blsp_i2c_softc *sc, bus_size_t off, uint32_t val)
++{
++	bus_space_write_4(sc->sc_bustag, sc->sc_bushandle, off, val);
++}
++
++static int
++blsp_i2c_wait_while_busy(struct blsp_i2c_softc *sc, uint32_t timeout_usec)
++{
++	uint32_t status;
++	uint32_t wait = timeout_usec;
++	while (wait--) {
++		status = blsp_i2c_read(sc, BLSP_I2C_M_GENI_STATUS);
++		if (!(status & BLSP_I2C_M_GENI_STATUS_BUSY))
++			return 0;
++		DELAY(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++blsp_i2c_wait_cmd_done(struct blsp_i2c_softc *sc, uint32_t timeout_usec)
++{
++	uint32_t status;
++	uint32_t wait = timeout_usec;
++	while (wait--) {
++		status = blsp_i2c_read(sc, BLSP_I2C_M_IRQ_STATUS);
++		if (status & BLSP_I2C_M_IRQ_CMD_DONE) {
++			blsp_i2c_write(sc, BLSP_I2C_M_IRQ_CLR, BLSP_I2C_M_IRQ_CMD_DONE);
++			if (status & BLSP_I2C_M_IRQ_NACK) return EIO;
++			if (status & BLSP_I2C_M_IRQ_ARB_LOST) return EIO;
++			if (status & BLSP_I2C_M_IRQ_BUS_ERR) return EIO;
++			return 0;
++		}
++		DELAY(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++blsp_i2c_init(struct blsp_i2c_softc *sc)
++{
++	uint32_t reg;
++	blsp_i2c_write(sc, BLSP_I2C_MAIN_CMD, BLSP_I2C_MAIN_CMD_RESET);
++	DELAY(1000);
++
++	reg = blsp_i2c_read(sc, BLSP_I2C_CONFIG);
++	reg &= ~(BLSP_I2C_CONFIG_SLAVE | BLSP_I2C_CONFIG_SPI);
++	reg |= BLSP_I2C_CONFIG_MASTER | BLSP_I2C_CONFIG_I2C;
++	blsp_i2c_write(sc, BLSP_I2C_CONFIG, reg);
++
++	blsp_i2c_write(sc, BLSP_I2C_MAIN_CMD, BLSP_I2C_MAIN_CMD_ENABLE);
++	DELAY(1000);
++
++	blsp_i2c_write(sc, BLSP_I2C_M_IRQ_CLR, 0xFFFFFFFF);
++	blsp_i2c_write(sc, BLSP_I2C_M_IRQ_EN, 0);
++
++	sc->sc_initialized = true;
++	return 0;
++}
++
++static int
++blsp_i2c_xfer(struct blsp_i2c_softc *sc, uint16_t addr, uint8_t *txbuf, size_t txlen, uint8_t *rxbuf, size_t rxlen)
++{
++	uint32_t reg;
++	size_t i;
++	int error;
++
++	if (!sc->sc_initialized) return ENXIO;
++
++	error = blsp_i2c_wait_while_busy(sc, 100000);
++	if (error) return error;
++
++	reg = blsp_i2c_read(sc, BLSP_I2C_M_CMD);
++	reg &= ~0x3FF;
++	reg |= (addr & 0x3FF);
++	blsp_i2c_write(sc, BLSP_I2C_M_CMD, reg);
++
++	if (txlen > 0) {
++		blsp_i2c_write(sc, BLSP_I2C_M_OUTPUT_REM, txlen);
++		blsp_i2c_write(sc, BLSP_I2C_M_OUTPUT_CUR, 0);
++
++		for (i = 0; i < txlen; i++) {
++			while (blsp_i2c_read(sc, BLSP_I2C_M_GENI_STATUS) & BLSP_I2C_M_GENI_STATUS_TX_FIFO_FULL) DELAY(1);
++			blsp_i2c_write(sc, BLSP_I2C_M_TX_FIFO, txbuf[i]);
++		}
++
++		blsp_i2c_write(sc, BLSP_I2C_M_IRQ_CLR, 0xFFFFFFFF);
++		blsp_i2c_write(sc, BLSP_I2C_M_CMD, blsp_i2c_read(sc, BLSP_I2C_M_CMD) | BLSP_I2C_M_CMD_WRITE | BLSP_I2C_M_CMD_START);
++
++		error = blsp_i2c_wait_cmd_done(sc, 100000);
++		if (error) return error;
++
++		if (rxlen == 0) {
++			blsp_i2c_write(sc, BLSP_I2C_M_CMD, blsp_i2c_read(sc, BLSP_I2C_M_CMD) | BLSP_I2C_M_CMD_STOP);
++			blsp_i2c_wait_cmd_done(sc, 100000);
++		}
++	}
++
++	if (rxlen > 0) {
++		blsp_i2c_write(sc, BLSP_I2C_M_INPUT_REM, rxlen);
++		blsp_i2c_write(sc, BLSP_I2C_M_INPUT_CUR, 0);
++
++		blsp_i2c_write(sc, BLSP_I2C_M_IRQ_CLR, 0xFFFFFFFF);
++		uint32_t cmd = BLSP_I2C_M_CMD_READ | BLSP_I2C_M_CMD_START;
++		if (txlen > 0) cmd |= BLSP_I2C_M_CMD_RESTART;
++		blsp_i2c_write(sc, BLSP_I2C_M_CMD, blsp_i2c_read(sc, BLSP_I2C_M_CMD) | cmd);
++
++		error = blsp_i2c_wait_cmd_done(sc, 100000);
++		if (error) return error;
++
++		for (i = 0; i < rxlen; i++) {
++			while (blsp_i2c_read(sc, BLSP_I2C_M_GENI_STATUS) & BLSP_I2C_M_GENI_STATUS_RX_FIFO_EMPTY) DELAY(1);
++			rxbuf[i] = blsp_i2c_read(sc, BLSP_I2C_M_RX_FIFO);
++		}
++
++		blsp_i2c_write(sc, BLSP_I2C_M_CMD, blsp_i2c_read(sc, BLSP_I2C_M_CMD) | BLSP_I2C_M_CMD_STOP);
++		blsp_i2c_wait_cmd_done(sc, 100000);
++	}
++
++	return 0;
++}
++
++int
++blsp_i2c_read_reg(uint16_t addr, uint8_t reg, uint8_t *val)
++{
++	struct blsp_i2c_softc *sc = blsp_i2c_sc;
++	if (!sc) return ENXIO;
++	return blsp_i2c_xfer(sc, addr, &reg, 1, val, 1);
++}
++
++int
++blsp_i2c_write_reg(uint16_t addr, uint8_t reg, uint8_t val)
++{
++	struct blsp_i2c_softc *sc = blsp_i2c_sc;
++	if (!sc) return ENXIO;
++	uint8_t buf[2] = { reg, val };
++	return blsp_i2c_xfer(sc, addr, buf, 2, NULL, 0);
++}
++
++int
++blsp_i2c_read_block(uint16_t addr, uint8_t reg, uint8_t *buf, size_t len)
++{
++	struct blsp_i2c_softc *sc = blsp_i2c_sc;
++	if (!sc) return ENXIO;
++	return blsp_i2c_xfer(sc, addr, &reg, 1, buf, len);
++}
++
++static int
++blsp_i2c_probe(device_t dev)
++{
++	struct blsp_i2c_softc *sc = device_get_softc(dev);
++	sc->sc_dev = dev;
++
++	sc->sc_bustag = arm_generic_bs_tag;
++	if (bus_space_map(sc->sc_bustag, M01_BLSP1_I2C_BASE, M01_BLSP_I2C_SIZE, 0, &sc->sc_bushandle)) {
++		device_printf(dev, "Cannot map BLSP I2C registers\n");
++		return ENXIO;
++	}
++
++	sc->sc_base = M01_BLSP1_I2C_BASE;
++	sc->sc_clk_hz = BLSP_I2C_CLK_HZ;
++	blsp_i2c_sc = sc;
++	return 0;
++}
++
++static int
++blsp_i2c_attach(device_t dev)
++{
++	struct blsp_i2c_softc *sc = device_get_softc(dev);
++	int error;
++	error = blsp_i2c_init(sc);
++	if (error) {
++		device_printf(dev, "BLSP I2C init failed: %d\n", error);
++		return error;
++	}
++	device_printf(dev, "BLSP I2C attached at 0x%x\n", sc->sc_base);
++	return 0;
++}
++
++static device_method_t blsp_i2c_methods[] = {
++	DEVMETHOD(device_probe, blsp_i2c_probe),
++	DEVMETHOD(device_attach, blsp_i2c_attach),
++	DEVMETHOD(device_detach, bus_generic_detach),
++	{ 0, 0 }
++};
++
++static driver_t blsp_i2c_driver = {
++	"blsp_i2c",
++	blsp_i2c_methods,
++	sizeof(struct blsp_i2c_softc)
++};
++
++DRIVER_MODULE(blsp_i2c, simplebus, blsp_i2c_driver, NULL, NULL);

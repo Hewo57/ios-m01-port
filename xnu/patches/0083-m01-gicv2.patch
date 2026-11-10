@@ -1,0 +1,309 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index a686d4f..aa751f8 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/arm/protos.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -230,6 +231,11 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
++#if defined(M01)
++	/* GICv2 has no ICC_SGI1R: use the distributor's SGIR with the target
++	 * CPU-interface bit recorded at pe_init_fiq() time. */
++	pe_arm_gic_send_sgi(logical);
++#else
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+@@ -243,6 +249,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
+ 	__builtin_arm_isb(ISB_SY);
++#endif
+ }
+ 
+ kern_return_t
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..f1729ea 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1856,7 +1856,43 @@ sleh_irq(arm_saved_state_t *state)
+ #endif
+ 
+ 
+-#if defined(SWEET)
++#if defined(M01)
++	/*
++	 * M01: GICv2 with TrustZone owning Group 0.  The timer, IPIs and device
++	 * interrupts are Group 1 and arrive here as IRQs; acknowledge through
++	 * the memory-mapped CPU interface.
++	 */
++	uint32_t iar = pe_arm_gic_ack();
++	uint32_t intid = iar & 0x3FF;
++
++	if (intid >= 1020) {
++		return; /* spurious */
++	}
++	if (intid == sweet_vtimer_intid) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++		cdp->cpu_decrementer = -1; /* Large */
++		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		rtclock_intr(TRUE);
++		INTERRUPT_MASKED_DEBUG_END();
++		pe_arm_gic_eoi(iar);
++	} else if (intid < 16) {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
++		/* Ack before handling so an IPI raised meanwhile is not lost */
++		pe_arm_gic_eoi(iar);
++		__builtin_arm_isb(ISB_SY);
++		cpu_signal_handler();
++	} else {
++		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++		if (cdp->interrupt_handler) {
++			cdp->interrupt_handler(cdp->interrupt_target,
++			    cdp->interrupt_refCon,
++			    cdp->interrupt_nub,
++			    intid);
++		}
++		pe_arm_gic_eoi(iar);
++	}
++	__builtin_arm_isb(ISB_SY);
++#elif defined(SWEET)
+ 	/*
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+@@ -1903,7 +1939,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	    cdp->interrupt_nub,
+ 	    cdp->interrupt_source);
+ #endif
+-#endif /* SWEET */
++#endif /* M01 || SWEET */
+ 
+ 	entropy_collect();
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..21886ae 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -306,11 +306,14 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
+-	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
++#if !defined(M01)
++	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access.
++	 * M01 has a GICv2: these system registers are undefined there. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif /* !M01 */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..d9203c3 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,165 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif HAS_GIC_V2
++/*
++ * GICv2 (M01): a memory-mapped distributor and per-CPU interface.  The
++ * bootloader leaves TrustZone owning Group 0, so every interrupt XNU uses
++ * (architected virtual timer, SGIs, device SPIs) is Group 1 and is taken as
++ * an IRQ through sleh_irq().
++ */
++#if defined(SWEET)
++/* Phone default; the live FDT may override it. */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++#endif
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++
++/*
++ * GICv2 CPU interface number used as the SGIR target bit for each logical
++ * CPU.  A PPI's banked ITARGETSR view reports the local interface's bit, so
++ * this is the only portable way to map logical CPUs to SGIR targets.
++ */
++static uint8_t sweet_gic_cpu_map[MAX_CPUS];
++
++static uint32_t
++_gic_read32(vm_offset_t addr)
++{
++	return *((volatile uint32_t *) addr);
++}
++
++static void
++_gic_write32(vm_offset_t addr, uint32_t value)
++{
++	*((volatile uint32_t *) addr) = value;
++}
++
++#define gicd_read32(offset) (_gic_read32(gicd_base + (offset)))
++#define gicd_write32(offset, data) (_gic_write32(gicd_base + (offset), (data)))
++#define gicc_read32(offset) (_gic_read32(gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(gicc_base + (offset), (data)))
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++
++	// gicd_base is 0x0 only before it's initialized by the boot processor.
++	// Avoid calling SecureDT* routines on secondary processors to avoid
++	// race conditions because they are not thread-safe.
++	if (!gicd_base) {
++		// Find GIC DT node
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++
++		// Find "reg" property
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++
++		// Need at least GICD base, GICD size, GICC base and GICC size
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++
++#if defined(SWEET)
++		/* Read only on the boot CPU, before the GIC and RO-late lockdown. */
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++		kprintf("SWEET GIC: virtual timer INTID %u (GICv2)\n", sweet_vtimer_intid);
++#endif
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++
++		uint64_t const gicd_base_prop = ((uint64_t const *) prop)[0];
++		uint64_t const gicd_size_prop = ((uint64_t const *) prop)[1];
++		uint64_t const gicc_base_prop = ((uint64_t const *) prop)[2];
++		uint64_t const gicc_size_prop = ((uint64_t const *) prop)[3];
++
++		gicd_base = ml_io_map(soc_base_phys + gicd_base_prop, gicd_size_prop);
++		if (!gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++
++		gicc_base = ml_io_map(soc_base_phys + gicc_base_prop, gicc_size_prop);
++		if (!gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++	}
++
++	/* Per-CPU interface: no priority splitting, accept every priority. */
++	gicc_write32(GICC_PMR, 0xFF);
++	gicc_write32(GICC_BPR, 0);
++	gicc_write32(GICC_CTLR, GICC_CTLR_ENABLEGRP1);
++
++	/*
++	 * Record this CPU's SGIR target bit before enabling interrupts.
++	 * ITARGETSR for INTIDs 0-31 is banked per CPU interface and read-only;
++	 * its low byte is the local interface's bit in the SGIR target list.
++	 */
++	unsigned int cpu = ml_get_cpu_number_local();
++	uint32_t target = gicd_read32(GICD_ITARGETSR + (16 / 4) * 4) & 0xFF;
++	__atomic_store_n(&sweet_gic_cpu_map[cpu], (uint8_t)target, __ATOMIC_RELEASE);
++
++	/* Group 1 owns everything XNU uses. */
++	gicd_write32(GICD_IGROUPR, gicd_read32(GICD_IGROUPR) |
++	    (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/* Private interrupts: one priority byte per INTID, 0xA0 for all. */
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicd_write32(GICD_IPRIORITYR + i, 0xA0A0A0A0);
++	}
++	gicd_write32(GICD_ISENABLER, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/* Enable forwarding of Group 1 to this CPU interface. */
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++	__builtin_arm_isb(ISB_SY);
++}
++
++uint32_t
++pe_arm_gic_ack(void)
++{
++	return gicc_read32(GICC_IAR);
++}
++
++void
++pe_arm_gic_eoi(uint32_t iar)
++{
++	gicc_write32(GICC_EOIR, iar);
++}
++
++void
++pe_arm_gic_send_sgi(unsigned int cpu)
++{
++	if (cpu >= MAX_CPUS) {
++		panic("%s: invalid logical CPU %u", __func__, cpu);
++	}
++	uint32_t target = __atomic_load_n(&sweet_gic_cpu_map[cpu], __ATOMIC_ACQUIRE);
++	if (target == 0) {
++		panic("%s: CPU %u has no GICv2 interface mapping", __func__, cpu);
++	}
++	__builtin_arm_dsb(DSB_SY);
++	gicd_write32(GICD_SGIR, GICD_SGIR_NSATTBR | GICD_SGIR_TARGET_LIST |
++	    ((target & 0xFF) << 16) | SWEET_IPI_SGI);
++	__builtin_arm_isb(ISB_SY);
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..421740c 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -39,6 +39,12 @@ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
++#if defined(ARM64_BOARD_CONFIG_M01)
++/* GICv2 CPU-interface accessors used by sleh_irq() and SweetCPU. */
++extern uint32_t pe_arm_gic_ack(void);
++extern void pe_arm_gic_eoi(uint32_t iar);
++extern void pe_arm_gic_send_sgi(unsigned int cpu);
++#endif
+ 
+ #ifdef PRIVATE
+ /**
+diff --git a/pexpert/pexpert/arm64/M01.h b/pexpert/pexpert/arm64/M01.h
+index 7409bba..2b50bb5 100644
+--- a/pexpert/pexpert/arm64/M01.h
++++ b/pexpert/pexpert/arm64/M01.h
+@@ -59,6 +59,7 @@
+ #define GICC_HPPIR                0x018
+ #define GICC_DIR                  0x1000
+ 
++#define GICD_IGROUPR              0x080
+ #define GICD_ISENABLER            0x100
+ #define GICD_ICENABLER            0x180
+ #define GICD_ISPENDR              0x200

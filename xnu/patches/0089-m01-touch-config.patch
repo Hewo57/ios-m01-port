@@ -1,0 +1,13 @@
+diff --git a/bsd/conf/files.arm64 b/bsd/conf/files.arm64
+index xyz123..abc456 100644
+--- a/bsd/conf/files.arm64
++++ b/bsd/conf/files.arm64
+@@ -100,6 +100,8 @@ device	simplebus
+ device	psci
+ device	sweet_cpu
+ device	sweet_ufs
++device	blsp_i2c
++device	ft5446
+ device	sdhci
+ device	sweet_gpio
+ device	sweet_i2c

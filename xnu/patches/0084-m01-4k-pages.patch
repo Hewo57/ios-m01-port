@@ -1,0 +1,78 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..390b39c 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -399,6 +399,14 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
++#if defined(M01)
++		/*
++		 * The Cortex-A53 implements only the 4K translation granule, so
++		 * the kernel must use 4K pages even with more than 1GB of RAM.
++		 * M01.h does not define __ARM_16K_PG__, so ARM_PGSHIFT is 12.
++		 */
++		PAGE_SHIFT_CONST = ARM_PGSHIFT;
++#else
+ 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
+ 			/*
+ 			 * arm64 device with > 1GB of RAM:
+@@ -413,6 +421,7 @@ arm_init(
+ 			 */
+ 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+ 		}
++#endif /* M01 */
+ 
+ 		/* 32-bit apps always see 16KB page size */
+ 		page_shift_user32 = PAGE_MAX_SHIFT;
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba..4dcd29a 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -272,8 +272,12 @@ _pfz_trylock_and_enqueue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+-	// Try to grab the lock
+-	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++	// Try to grab the lock: LL/SC, the Cortex-A53 (ARMv8.0) has no casa
++1:	ldaxr	w10, [x3]		 // acquire, like casa
++	cbnz	w10, 2f			 // held: fail
++	stxr	w12, w11, [x3]
++	cbnz	w12, 1b			 // lost the reservation: retry
++2:	clrex
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -293,7 +297,7 @@ Lnon_empty_queue:
+ Lset_new_tail:
+ 	str		x1, [x0, #8]		// Set tail = new elem
+ 
+-	// Drop spin lock with release barrier (pairs with acquire in casa)
++	// Drop spin lock with release barrier (pairs with acquire in the LL/SC lock)
+ 	stlr	wzr, [x3]
+ 
+ 	mov		x0, xzr				// Mark success
+@@ -323,7 +327,12 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+-	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++	// LL/SC, the Cortex-A53 (ARMv8.0) has no casa
++1:	ldaxr	w10, [x2]		 // acquire, like casa
++	cbnz	w10, 2f			 // held: fail
++	stxr	w12, w11, [x2]
++	cbnz	w12, 1b			 // lost the reservation: retry
++2:	clrex
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -346,7 +355,7 @@ Lupdate_new_head:
+ 
+ Lreturn_head:
+ 	mov		x0, x10			// Move head to x0
+-	stlr	wzr, [x2]		// Drop spin lock with release barrier (pairs with acquire in casa)
++	stlr	wzr, [x2]		// Drop spin lock with release barrier (pairs with acquire in the LL/SC lock)
+ 
+ Ltrylock_dequeue_exit:
+ 	POP_FRAME

@@ -1,0 +1,209 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..a686d4f 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,16 +73,32 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(M01)
++	/*
++	 * SDM439: Aff1 selects the cluster and Aff0 the core within it:
++	 * little 0x000-0x003, big 0x100-0x103.
++	 */
++	if (cpu->phys_id > 0x103 || (cpu->phys_id & 0xFC) != 0 ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++		panic("SWEET CPU: invalid M01 topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
++#endif
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if defined(M01)
++	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..6cf0595 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,11 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_M01)
++    "     'IONameMatch'     = 'arm,cortex-a53';"
++#else
+     "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..4976baf 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET M01
+ 
+ endif
+ 
+@@ -62,6 +62,9 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# M01 is an ARMv8.0 Cortex-A53: -mcpu keeps Apple clang from enabling LSE.
++# ARM64_BOARD_CONFIG_SWEET is defined too so the shared sweet drivers compile.
++MACHINE_FLAGS_ARM64_M01 = -DARM64_BOARD_CONFIG_M01 -DARM64_BOARD_CONFIG_SWEET -mcpu=cortex-a53
+ 
+ 
+ #
+@@ -260,8 +263,9 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet's Cortex-A76/A55 and M01's Cortex-A53 have no pointer
++# authentication: stay plain arm64.
++ifeq ($(filter $(CURRENT_MACHINE_CONFIG),SWEET M01),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/pexpert/pexpert/arm64/M01.h b/pexpert/pexpert/arm64/M01.h
+new file mode 100644
+index 0000000..7409bba
+--- /dev/null
++++ b/pexpert/pexpert/arm64/M01.h
+@@ -0,0 +1,81 @@
++/*
++ * Board config for the Samsung Galaxy M01 (SM-M015G/DS, Qualcomm SDM439 /
++ * Snapdragon 439): eight Cortex-A53 cores in two clusters of four.
++ *
++ * The A53 is ARMv8.0-A: no LSE atomics, no PAN, no 16K page granule.  The
++ * interrupt controller is a GICv2 (distributor + per-CPU interface) rather
++ * than the GICv3 used by sweet, and the bootloader is Samsung's Odin-only
++ * ABL, so there is no fastboot and no recovery ramdisk handoff.
++ *
++ * This file is included instead of SWEET.h, but it defines SWEET so that the
++ * shared device-tree platform, timer and CPU drivers compile unchanged.
++ */
++
++#ifndef _PEXPERT_ARM64_M01_H
++#define _PEXPERT_ARM64_M01_H
++
++#define NO_MONITOR                1
++#define NO_ECORE                  1
++
++#define M01                       1
++#define SWEET                     1
++
++/* All eight A53s as one homogeneous SMP cluster (PSCI CPU_ON). */
++#define SWEET_SMP_MAX_CPUS         8
++
++#define ARM_ARCH_TIMER
++#define __ARM_ARCH__              8
++#define __ARM_VMSA__              8
++#define __ARM_VFP__               4
++#define __ARM_COHERENT_CACHE__    1
++#define __ARM_DEBUG__             7
++#define __ARM_ENABLE_SWAP__       1
++#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
++/* no __ARM_PAN_AVAILABLE__: PAN is ARMv8.1, the A53 is ARMv8.0 */
++/* no __ARM_16K_PG__: the A53 supports only the 4K translation granule */
++
++#define HAS_GIC_V2                1
++
++#ifndef ASSEMBLER
++#define PLATFORM_PANIC_LOG_DISABLED
++#endif /* ! ASSEMBLER */
++
++/*
++ * msm8937 remaps the architected timer PPIs: the DT lists
++ * <1 2> secure phys, <1 3> non-secure phys, <1 4> virtual, <1 1> hyp.
++ * XNU drives the virtual timer (CNTV), so its PPI is 4 => INTID 16 + 4 = 20.
++ */
++#define SWEET_VTIMER_INTID        20
++#define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
++
++#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
++
++/* GICv2 register definitions (Arm IHI 0048B) */
++#define GICD_CTLR                 0x000
++#define GICC_CTLR                 0x000
++#define GICC_PMR                  0x004
++#define GICC_BPR                  0x008
++#define GICC_IAR                  0x00C
++#define GICC_EOIR                 0x010
++#define GICC_HPPIR                0x018
++#define GICC_DIR                  0x1000
++
++#define GICD_ISENABLER            0x100
++#define GICD_ICENABLER            0x180
++#define GICD_ISPENDR              0x200
++#define GICD_ICPENDR              0x280
++#define GICD_ISACTIVER            0x300
++#define GICD_ICACTIVER            0x380
++#define GICD_IPRIORITYR           0x400
++#define GICD_ITARGETSR            0x800
++#define GICD_ICFGR                0xC00
++#define GICD_SGIR                 0xF00
++
++/* Non-secure view of GICD_CTLR / GICC_CTLR when DS=0. */
++#define GICD_CTLR_ENABLEGRP1      0x1
++#define GICC_CTLR_ENABLEGRP1      0x1
++
++#define GICD_SGIR_NSATTBR         (1U << 15)
++#define GICD_SGIR_TARGET_LIST     (0U << 24)
++#define GICD_SGIR_TARGET_SELF     (2U << 24)
++
++#endif /* ! _PEXPERT_ARM64_M01_H */
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..3064114 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -97,7 +97,18 @@
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
+-#ifdef ARM64_BOARD_CONFIG_SWEET
++#ifdef ARM64_BOARD_CONFIG_M01
++#include <pexpert/arm64/M01.h>
++
++#define MAX_L2_CLINE                   6
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               1
++
++#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
++
++#endif  /* ARM64_BOARD_CONFIG_M01 */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_M01)
+ #include <pexpert/arm64/SWEET.h>
+ 
+ #define MAX_L2_CLINE                   6
+@@ -106,7 +117,7 @@
+ 
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ 
+-#endif  /* ARM64_BOARD_CONFIG_SWEET */
++#endif  /* ARM64_BOARD_CONFIG_SWEET && !ARM64_BOARD_CONFIG_M01 */
+ 
+ #ifdef ARM64_BOARD_CONFIG_VMAPPLE
+ #include <pexpert/arm64/VMAPPLE.h>

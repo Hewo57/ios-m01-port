@@ -1,0 +1,258 @@
+diff --git a/bsd/dev/ft5446.c b/bsd/dev/ft5446.c
+new file mode 100644
+index 0000000..abcdef1
+--- /dev/null
++++ b/bsd/dev/ft5446.c
+@@ -0,0 +1,500 @@
++/*
++ * FT5446 capacitive touch controller driver for M01.
++ * I2C address 0x38, polled mode via BLSP I2C.
++ * Single-touch, 720x1520 panel.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/device.h>
++#include <sys/bus.h>
++#include <sys/malloc.h>
++#include <dev/hid/hid.h>
++#include <dev/hid/hidbus.h>
++
++#define FT5446_ADDR			0x38
++#define FT5446_REG_TOUCH_NUM		0x02
++#define FT5446_REG_TOUCH1_XH		0x03
++#define FT5446_REG_TOUCH1_XL		0x04
++#define FT5446_REG_TOUCH1_YH		0x05
++#define FT5446_REG_TOUCH1_YL		0x06
++#define FT5446_REG_ID_G_CHIPID		0xA3
++#define FT5446_REG_ID_G_VENID		0xA8
++#define FT5446_REG_ID_G_FIRMID		0xA6
++#define FT5446_REG_ID_G_THGROUP		0x80
++#define FT5446_REG_ID_G_TH_DIFF		0x85
++#define FT5446_REG_ID_G_CTRL		0x86
++#define FT5446_REG_ID_G_TIME_ENTER_MONITOR	0x87
++#define FT5446_REG_ID_G_PERIODACTIVE	0x88
++#define FT5446_REG_ID_G_PERIOD_MONITOR	0x89
++#define FT5446_REG_ID_G_AUTO_CLB		0xA1
++#define FT5446_REG_ID_G_MODE		0xA4
++#define FT5446_REG_ID_G_MODE_INT		0x5C
++
++#define FT5446_CHIP_ID			0x54
++#define FT5446_VENDOR_ID		0x79
++
++#define FT_TOUCH_EVENT_PRESS		0x00
++#define FT_TOUCH_EVENT_MOVE		0x01
++#define FT_TOUCH_EVENT_RELEASE		0x02
++#define FT_TOUCH_EVENT_NONE		0x03
++
++struct ft5446_softc {
++	device_t sc_dev;
++	struct hidbus *sc_hidbus;
++	int sc_poll_interval;
++	bool sc_running;
++	uint16_t sc_last_x;
++	uint16_t sc_last_y;
++	bool sc_touching;
++	struct callout sc_poll_ch;
++};
++
++static struct ft5446_softc *ft5446_sc = NULL;
++
++extern int blsp_i2c_read_reg(uint16_t addr, uint8_t reg, uint8_t *val);
++extern int blsp_i2c_write_reg(uint16_t addr, uint8_t reg, uint8_t val);
++extern int blsp_i2c_read_block(uint16_t addr, uint8_t reg, uint8_t *buf, size_t len);
++
++static int
++ft5446_read_reg(uint8_t reg, uint8_t *val)
++{
++	return blsp_i2c_read_reg(FT5446_ADDR, reg, val);
++}
++
++static int
++ft5446_write_reg(uint8_t reg, uint8_t val)
++{
++	return blsp_i2c_write_reg(FT5446_ADDR, reg, val);
++}
++
++static int
++ft5446_read_block(uint8_t reg, uint8_t *buf, size_t len)
++{
++	return blsp_i2c_read_block(FT5446_ADDR, reg, buf, len);
++}
++
++static int
++ft5446_init(struct ft5446_softc *sc)
++{
++	uint8_t val;
++	int error;
++
++	error = ft5446_read_reg(FT5446_REG_ID_G_CHIPID, &val);
++	if (error) {
++		device_printf(sc->sc_dev, "Failed to read chip ID\n");
++		return error;
++	}
++	if (val != FT5446_CHIP_ID) {
++		device_printf(sc->sc_dev, "Unexpected chip ID: 0x%x (expected 0x%x)\n", val, FT5446_CHIP_ID);
++		return ENXIO;
++	}
++
++	error = ft5446_read_reg(FT5446_REG_ID_G_VENID, &val);
++	if (error || val != FT5446_VENDOR_ID) {
++		device_printf(sc->sc_dev, "Unexpected vendor ID: 0x%x\n", val);
++	}
++
++	error = ft5446_read_reg(FT5446_REG_ID_G_FIRMID, &val);
++	if (!error) device_printf(sc->sc_dev, "FT5446 firmware ID: 0x%x\n", val);
++
++	ft5446_write_reg(FT5446_REG_ID_G_THGROUP, 0x18);
++	ft5446_write_reg(FT5446_REG_ID_G_TH_DIFF, 0x0A);
++	ft5446_write_reg(FT5446_REG_ID_G_CTRL, 0x02);
++	ft5446_write_reg(FT5446_REG_ID_G_TIME_ENTER_MONITOR, 0x0A);
++	ft5446_write_reg(FT5446_REG_ID_G_PERIODACTIVE, 0x0C);
++	ft5446_write_reg(FT5446_REG_ID_G_PERIOD_MONITOR, 0x32);
++	ft5446_write_reg(FT5446_REG_ID_G_AUTO_CLB, 0x00);
++	ft5446_write_reg(FT5446_REG_ID_G_MODE, 0x00);
++	ft5446_write_reg(FT5446_REG_ID_G_MODE_INT, 0x00);
++
++	DELAY(10000);
++	device_printf(sc->sc_dev, "FT5446 initialized\n");
++	return 0;
++}
++
++static void
++ft5446_poll(void *arg)
++{
++	struct ft5446_softc *sc = arg;
++	uint8_t buf[6];
++	uint16_t x, y;
++	uint8_t touch_num;
++	int error;
++
++	if (!sc->sc_running) return;
++
++	error = ft5446_read_reg(FT5446_REG_TOUCH_NUM, &touch_num);
++	if (error || touch_num == 0) {
++		if (sc->sc_touching) {
++			hidbus_report_touch_up(sc->sc_hidbus);
++			sc->sc_touching = false;
++		}
++		goto reschedule;
++	}
++
++	error = ft5446_read_block(FT5446_REG_TOUCH1_XH, buf, 6);
++	if (error) goto reschedule;
++
++	uint8_t event = (buf[0] >> 6) & 0x3;
++	x = ((buf[0] & 0x0F) << 8) | buf[1];
++	y = ((buf[2] & 0x0F) << 8) | buf[3];
++
++	if (x >= 720) x = 719;
++	if (y >= 1520) y = 1519;
++
++	switch (event) {
++	case FT_TOUCH_EVENT_PRESS:
++	case FT_TOUCH_EVENT_MOVE:
++		if (!sc->sc_touching) {
++			hidbus_report_touch_down(sc->sc_hidbus, x, y, 0, 0);
++			sc->sc_touching = true;
++		} else {
++			hidbus_report_touch_motion(sc->sc_hidbus, x, y, 0, 0);
++		}
++		sc->sc_last_x = x;
++		sc->sc_last_y = y;
++		break;
++	case FT_TOUCH_EVENT_RELEASE:
++		if (sc->sc_touching) {
++			hidbus_report_touch_up(sc->sc_hidbus);
++			sc->sc_touching = false;
++		}
++		break;
++	default:
++		break;
++	}
++
++reschedule:
++	callout_reset(&sc->sc_poll_ch, mstohz(sc->sc_poll_interval), ft5446_poll, sc);
++}
++
++static int
++ft5446_hid_open(struct hidbus *hb, void *context)
++{
++	struct ft5446_softc *sc = context;
++	sc->sc_hidbus = hb;
++	sc->sc_running = true;
++	callout_reset(&sc->sc_poll_ch, mstohz(sc->sc_poll_interval), ft5446_poll, sc);
++	return 0;
++}
++
++static void
++ft5446_hid_close(struct hidbus *hb, void *context)
++{
++	struct ft5446_softc *sc = context;
++	sc->sc_running = false;
++	callout_stop(&sc->sc_poll_ch);
++}
++
++static int
++ft5446_hid_get_report(struct hidbus *hb, void *context, int type, int id, void *buf, size_t len, int flags)
++{
++	return ENOTTY;
++}
++
++static int
++ft5446_hid_set_report(struct hidbus *hb, void *context, int type, int id, void *buf, size_t len, int flags)
++{
++	return ENOTTY;
++}
++
++static struct hidbus_methods ft5446_hid_methods = {
++	.hb_open = ft5446_hid_open,
++	.hb_close = ft5446_hid_close,
++	.hb_get_report = ft5446_hid_get_report,
++	.hb_set_report = ft5446_hid_set_report,
++};
++
++static int
++ft5446_probe(device_t dev)
++{
++	struct ft5446_softc *sc = device_get_softc(dev);
++	sc->sc_dev = dev;
++	return 0;
++}
++
++static int
++ft5446_attach(device_t dev)
++{
++	struct ft5446_softc *sc = device_get_softc(dev);
++	int error;
++
++	sc->sc_poll_interval = 10;
++	callout_init(&sc->sc_poll_ch, 1);
++
++	error = ft5446_init(sc);
++	if (error) {
++		device_printf(dev, "FT5446 init failed: %d\n", error);
++		return error;
++	}
++
++	hidbus_register(dev, &ft5446_hid_methods, sc);
++
++	ft5446_sc = sc;
++	device_printf(dev, "FT5446 touch attached\n");
++	return 0;
++}
++
++static device_method_t ft5446_methods[] = {
++	DEVMETHOD(device_probe, ft5446_probe),
++	DEVMETHOD(device_attach, ft5446_attach),
++	DEVMETHOD(device_detach, bus_generic_detach),
++	{ 0, 0 }
++};
++
++static driver_t ft5446_driver = {
++	"ft5446",
++	ft5446_methods,
++	sizeof(struct ft5446_softc)
++};
++
++DRIVER_MODULE(ft5446, blsp_i2c, ft5446_driver, NULL, NULL);

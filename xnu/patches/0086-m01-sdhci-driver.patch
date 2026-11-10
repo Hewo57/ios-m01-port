@@ -1,0 +1,795 @@
+diff --git a/bsd/dev/sdhci_m01.c b/bsd/dev/sdhci_m01.c
+new file mode 100644
+index 0000000..abcdef1
+--- /dev/null
++++ b/bsd/dev/sdhci_m01.c
+@@ -0,0 +1,1200 @@
++/*
++ * SDHCI driver for Samsung Galaxy M01 (SDM439) eMMC/microSD.
++ * Based on standard SDHCI spec and Qualcomm MSM SDHCI variant.
++ * Minimal implementation for read-only eMMC boot.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/buf.h>
++#include <sys/device.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/proc.h>
++#include <sys/disklabel.h>
++#include <sys/dkio.h>
++#include <machine/bus.h>
++#include <machine/cpu.h>
++#include <arm64/armreg.h>
++
++/* SDHCI register offsets (standard) */
++#define SDHCI_SYSADDR		0x00
++#define SDHCI_BLKSZ		0x04
++#define SDHCI_BLKCNT		0x06
++#define SDHCI_ARG		0x08
++#define SDHCI_CMD		0x0c
++#define SDHCI_RESP		0x10
++#define SDHCI_DATA		0x20
++#define SDHCI_PRESTATE		0x24
++#define SDHCI_HOSTCTL		0x28
++#define SDHCI_POWER		0x29
++#define SDHCI_BLKGAP		0x2a
++#define SDHCI_WAKEUP		0x2b
++#define SDHCI_CLKCTL		0x2c
++#define SDHCI_TIMEOUT		0x2e
++#define SDHCI_SWRST		0x2f
++#define SDHCI_NORINTSTS		0x30
++#define SDHCI_NORINTEN		0x34
++#define SDHCI_ERRINTSTS		0x38
++#define SDHCI_ERRINTEN		0x3c
++#define SDHCI_ACMDERR		0x40
++#define SDHCI_HOSTCTL2		0x3e
++#define SDHCI_CAP		0x40
++#define SDHCI_CAP2		0x44
++#define SDHCI_MAXCUR		0x48
++
++/* Standard command register bits */
++#define SDHCI_CMD_RESP_NONE		(0 << 13)
++#define SDHCI_CMD_RESP_R1		(1 << 13)
++#define SDHCI_CMD_RESP_R1B		(2 << 13)
++#define SDHCI_CMD_RESP_R2		(3 << 13)
++#define SDHCI_CMD_RESP_R3		(4 << 13)
++#define SDHCI_CMD_RESP_R4		(5 << 13)
++#define SDHCI_CMD_RESP_R5		(6 << 13)
++#define SDHCI_CMD_RESP_R6		(7 << 13)
++#define SDHCI_CMD_CRC		(1 << 19)
++#define SDHCI_CMD_INDEX		(1 << 20)
++#define SDHCI_CMD_DATA		(1 << 21)
++#define SDHCI_CMD_DMA		(1 << 22)
++#define SDHCI_CMD_TYPE_NORMAL		(0 << 22)
++#define SDHCI_CMD_TYPE_SUSPEND		(1 << 22)
++#define SDHCI_CMD_TYPE_RESUME		(2 << 22)
++#define SDHCI_CMD_TYPE_ABORT		(3 << 22)
++
++/* Present state register bits */
++#define SDHCI_PRESTATE_CMD_INHIBIT	(1 << 0)
++#define SDHCI_PRESTATE_DAT_INHIBIT	(1 << 1)
++#define SDHCI_PRESTATE_DAT_ACTIVE	(1 << 2)
++#define SDHCI_PRESTATE_CARD_PRESENT	(1 << 16)
++#define SDHCI_PRESTATE_CARD_DETECT	(1 << 17)
++#define SDHCI_PRESTATE_DAT_LINE_MASK	(0xf << 20)
++
++/* Power control register bits */
++#define SDHCI_POWER_ON		(1 << 0)
++#define SDHCI_POWER_180		(5 << 1)
++#define SDHCI_POWER_300		(6 << 1)
++#define SDHCI_POWER_330		(7 << 1)
++
++/* Clock control register bits */
++#define SDHCI_CLOCK_INT_EN		(1 << 0)
++#define SDHCI_CLOCK_INT_STABLE		(1 << 1)
++#define SDHCI_CLOCK_CARD_EN		(1 << 2)
++#define SDHCI_DIVIDER_SHIFT		8
++#define SDHCI_DIVIDER_MASK		0xff
++#define SDHCI_DIVIDER_HI_SHIFT		6
++#define SDHCI_DIVIDER_HI_MASK		0x3
++
++/* Software reset register bits */
++#define SDHCI_SWRST_ALL		(1 << 0)
++#define SDHCI_SWRST_CMD		(1 << 1)
++#define SDHCI_SWRST_DAT		(1 << 2)
++
++/* Interrupt status bits */
++#define SDHCI_INT_CC		(1 << 0)
++#define SDHCI_INT_TC		(1 << 1)
++#define SDHCI_INT_BWR		(1 << 4)
++#define SDHCI_INT_BRR		(1 << 5)
++#define SDHCI_INT_CARD		(1 << 8)
++#define SDHCI_INT_ERR		(1 << 15)
++#define SDHCI_INT_CMD_TIMEOUT	(1 << 16)
++#define SDHCI_INT_CMD_CRC	(1 << 17)
++#define SDHCI_INT_CMD_END_BIT	(1 << 18)
++#define SDHCI_INT_CMD_IDX	(1 << 19)
++#define SDHCI_INT_DAT_TIMEOUT	(1 << 20)
++#define SDHCI_INT_DAT_CRC	(1 << 21)
++#define SDHCI_INT_DAT_END_BIT	(1 << 22)
++#define SDHCI_INT_ADMA_ERR	(1 << 25)
++
++/* Host control 2 bits */
++#define SDHCI_HOSTCTL2_UHS_SDR12	(0 << 13)
++#define SDHCI_HOSTCTL2_UHS_SDR25	(1 << 13)
++#define SDHCI_HOSTCTL2_UHS_SDR50	(2 << 13)
++#define SDHCI_HOSTCTL2_UHS_SDR104	(3 << 13)
++#define SDHCI_HOSTCTL2_UHS_DDR50	(4 << 13)
++#define SDHCI_HOSTCTL2_UHS_MASK		(7 << 13)
++#define SDHCI_HOSTCTL2_1_8V		(1 << 3)
++#define SDHCI_HOSTCTL2_EXEC_TUNING	(1 << 6)
++#define SDHCI_HOSTCTL2_SAMP_CLK_SEL	(1 << 7)
++
++/* Qualcomm MSM SDHCI specific registers (from core_mem region) */
++#define MSM_CORE_PWRCTL		0xE8
++#define MSM_CORE_PWRCTL_BUS_ON		(1 << 1)
++#define MSM_CORE_PWRCTL_IO_HIGH		(1 << 3)
++#define MSM_CORE_DLL_CONFIG		0x100
++#define MSM_CORE_DLL_CONFIG_2		0x1B4
++#define MSM_CORE_DLL_STATUS		0x108
++#define MSM_CORE_DLL_EN		(1 << 16)
++#define MSM_CORE_DLL_PDN		(1 << 29)
++#define MSM_CORE_DLL_RST		(1 << 30)
++#define MSM_CORE_DLL_LOCK		(1 << 7)
++#define MSM_CORE_DDR_DLL_LOCK		(1 << 11)
++#define MSM_CORE_CK_OUT_EN		(1 << 18)
++#define MSM_CORE_CDR_EN		(1 << 17)
++#define MSM_CORE_CDR_EXT_EN		(1 << 19)
++#define MSM_CORE_VENDOR_SPEC		0x10C
++#define MSM_CORE_CLK_PWRSAVE		(1 << 1)
++#define MSM_CORE_HC_MODE		0x78
++#define MSM_CORE_HC_MODE_EN		0x1
++#define MSM_CORE_VERSION		0x050
++#define MSM_CORE_SW_RST		(1 << 7)
++
++/* M01 SDHCI addresses */
++#define M01_SDHC1_HC_BASE		0x07824900  /* eMMC - 8-bit */
++#define M01_SDHC1_CORE_BASE		0x07824000
++#define M01_SDHC1_CMDQ_BASE		0x07824E00
++#define M01_SDHC2_HC_BASE		0x07864900  /* microSD - 4-bit */
++#define M01_SDHC2_CORE_BASE		0x07864000
++
++#define M01_SDHC_HC_SIZE		0x500
++#define M01_SDHC_CORE_SIZE		0x800
++#define M01_SDHC_CMDQ_SIZE		0x200
++
++#define M01_EMMC_CLOCK_HZ		200000000  /* 200 MHz max for HS200 */
++#define M01_EMMC_CLOCK_ID_HZ		400000    /* 400 KHz identification */
++
++/* ADMA descriptor */
++struct sdhci_adma_desc {
++	uint16_t attr;
++	uint16_t len;
++	uint32_t addr_lo;
++	uint32_t addr_hi;
++} __attribute__((packed, aligned(4)));
++
++#define ADMA_ATTR_VALID		(1 << 0)
++#define ADMA_ATTR_END		(1 << 1)
++#define ADMA_ATTR_INT		(1 << 2)
++#define ADMA_ATTR_ACT_TRAN	(2 << 4)
++
++struct sdhci_softc {
++	device_t sc_dev;
++	bus_space_tag_t sc_bustag_hc;
++	bus_space_handle_t sc_bushandle_hc;
++	bus_space_tag_t sc_bustag_core;
++	bus_space_handle_t sc_bushandle_core;
++	bus_dma_tag_t sc_dmatag;
++	bus_dmamap_t sc_dmamap;
++	struct disk *sc_disk;
++	struct bufq_state *sc_bufq;
++	int sc_flags;
++	uint32_t sc_base_hc;
++	uint32_t sc_base_core;
++	uint32_t sc_base_cmdq;
++	uint32_t sc_clock;
++	uint32_t sc_ocr;
++	uint32_t sc_rca;
++	uint32_t sc_capabilities;
++	uint32_t sc_capabilities2;
++	uint32_t sc_max_clk;
++	uint32_t sc_bus_width;
++	bool sc_card_present;
++	bool sc_initialized;
++	struct sdhci_adma_desc *sc_adma_table;
++	bus_dmamap_t sc_adma_map;
++	bus_addr_t sc_adma_phys;
++};
++
++static struct sdhci_softc *sdhci_sc = NULL;
++
++static inline uint8_t
++sdhci_read_1(struct sdhci_softc *sc, bus_size_t off)
++{
++	return bus_space_read_1(sc->sc_bustag_hc, sc->sc_bushandle_hc, off);
++}
++
++static inline uint16_t
++sdhci_read_2(struct sdhci_softc *sc, bus_size_t off)
++{
++	return bus_space_read_2(sc->sc_bustag_hc, sc->sc_bushandle_hc, off);
++}
++
++static inline uint32_t
++sdhci_read_4(struct sdhci_softc *sc, bus_size_t off)
++{
++	return bus_space_read_4(sc->sc_bustag_hc, sc->sc_bushandle_hc, off);
++}
++
++static inline void
++sdhci_write_1(struct sdhci_softc *sc, bus_size_t off, uint8_t val)
++{
++	bus_space_write_1(sc->sc_bustag_hc, sc->sc_bushandle_hc, off, val);
++}
++
++static inline void
++sdhci_write_2(struct sdhci_softc *sc, bus_size_t off, uint16_t val)
++{
++	bus_space_write_2(sc->sc_bustag_hc, sc->sc_bushandle_hc, off, val);
++}
++
++static inline void
++sdhci_write_4(struct sdhci_softc *sc, bus_size_t off, uint32_t val)
++{
++	bus_space_write_4(sc->sc_bustag_hc, sc->sc_bushandle_hc, off, val);
++}
++
++static inline uint32_t
++sdhci_core_read_4(struct sdhci_softc *sc, bus_size_t off)
++{
++	return bus_space_read_4(sc->sc_bustag_core, sc->sc_bushandle_core, off);
++}
++
++static inline void
++sdhci_core_write_4(struct sdhci_softc *sc, bus_size_t off, uint32_t val)
++{
++	bus_space_write_4(sc->sc_bustag_core, sc->sc_bushandle_core, off, val);
++}
++
++static void
++sdhci_delay(uint32_t usec)
++{
++	DELAY(usec);
++}
++
++static int
++sdhci_wait_for_bit(struct sdhci_softc *sc, bus_size_t off, uint32_t mask, uint32_t val, uint32_t timeout_usec)
++{
++	uint32_t reg;
++	uint32_t wait_cnt = timeout_usec;
++
++	while (wait_cnt--) {
++		reg = sdhci_read_4(sc, off);
++		if ((reg & mask) == val)
++			return 0;
++		DELAY(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++sdhci_core_wait_for_bit(struct sdhci_softc *sc, bus_size_t off, uint32_t mask, uint32_t val, uint32_t timeout_usec)
++{
++	uint32_t reg;
++	uint32_t wait_cnt = timeout_usec;
++
++	while (wait_cnt--) {
++		reg = sdhci_core_read_4(sc, off);
++		if ((reg & mask) == val)
++			return 0;
++		DELAY(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++sdhci_reset(struct sdhci_softc *sc, uint8_t reset_mask)
++{
++	sdhci_write_1(sc, SDHCI_SWRST, reset_mask);
++	return sdhci_wait_for_bit(sc, SDHCI_SWRST, reset_mask, 0, 100000);
++}
++
++static int
++sdhci_core_reset(struct sdhci_softc *sc)
++{
++	uint32_t reg;
++
++	reg = sdhci_core_read_4(sc, MSM_CORE_VERSION);
++	if ((reg & 0xF0000000) >> 28 >= 4) {
++		sdhci_core_write_4(sc, MSM_CORE_PWRCTL, MSM_CORE_SW_RST);
++	} else {
++		reg = sdhci_core_read_4(sc, MSM_CORE_HC_MODE);
++		sdhci_core_write_4(sc, MSM_CORE_HC_MODE, reg | MSM_CORE_HC_MODE_EN);
++	}
++	return 0;
++}
++
++static int
++sdhci_set_clock(struct sdhci_softc *sc, uint32_t target_hz)
++{
++	uint32_t div, reg;
++	uint32_t base_clk = sc->sc_max_clk;
++
++	if (target_hz == 0)
++		return EINVAL;
++
++	if (target_hz >= base_clk) {
++		div = 0;
++	} else {
++		for (div = 1; div < 256; div++) {
++			if ((base_clk / (2 * div)) <= target_hz)
++				break;
++		}
++	}
++
++	reg = sdhci_read_2(sc, SDHCI_CLKCTL);
++	reg &= ~(SDHCI_CLOCK_CARD_EN | SDHCI_CLOCK_INT_EN);
++	sdhci_write_2(sc, SDHCI_CLKCTL, reg);
++
++	if (div == 0) {
++		reg = sdhci_read_2(sc, SDHCI_CLKCTL);
++		reg &= ~(SDHCI_DIVIDER_MASK << SDHCI_DIVIDER_SHIFT);
++		reg &= ~(SDHCI_DIVIDER_HI_MASK << SDHCI_DIVIDER_HI_SHIFT);
++		sdhci_write_2(sc, SDHCI_CLKCTL, reg);
++	} else {
++		reg = sdhci_read_2(sc, SDHCI_CLKCTL);
++		reg &= ~(SDHCI_DIVIDER_MASK << SDHCI_DIVIDER_SHIFT);
++		reg &= ~(SDHCI_DIVIDER_HI_MASK << SDHCI_DIVIDER_HI_SHIFT);
++		reg |= (div & SDHCI_DIVIDER_MASK) << SDHCI_DIVIDER_SHIFT;
++		reg |= ((div >> 8) & SDHCI_DIVIDER_HI_MASK) << SDHCI_DIVIDER_HI_SHIFT;
++		sdhci_write_2(sc, SDHCI_CLKCTL, reg);
++	}
++
++	reg |= SDHCI_CLOCK_INT_EN;
++	sdhci_write_2(sc, SDHCI_CLKCTL, reg);
++
++	if (sdhci_wait_for_bit(sc, SDHCI_CLKCTL, SDHCI_CLOCK_INT_STABLE, SDHCI_CLOCK_INT_STABLE, 10000))
++		return ETIMEDOUT;
++
++	reg |= SDHCI_CLOCK_CARD_EN;
++	sdhci_write_2(sc, SDHCI_CLKCTL, reg);
++
++	sc->sc_clock = target_hz;
++	return 0;
++}
++
++static int
++sdhci_init_host(struct sdhci_softc *sc)
++{
++	uint32_t reg;
++	int error;
++
++	error = sdhci_reset(sc, SDHCI_SWRST_ALL);
++	if (error)
++		return error;
++
++	sdhci_core_reset(sc);
++
++	sc->sc_capabilities = sdhci_read_4(sc, SDHCI_CAP);
++	sc->sc_capabilities2 = sdhci_read_4(sc, SDHCI_CAP2);
++	sc->sc_max_clk = (sc->sc_capabilities >> 8) & 0xFF;
++	sc->sc_max_clk *= 1000000;
++	if (sc->sc_max_clk == 0)
++		sc->sc_max_clk = M01_EMMC_CLOCK_HZ;
++
++	sdhci_write_4(sc, SDHCI_NORINTEN, SDHCI_INT_CC | SDHCI_INT_TC | SDHCI_INT_BRR | SDHCI_INT_BWR);
++	sdhci_write_4(sc, SDHCI_ERRINTEN, SDHCI_INT_ERR | SDHCI_INT_CMD_TIMEOUT | SDHCI_INT_CMD_CRC | SDHCI_INT_CMD_END_BIT | SDHCI_INT_CMD_IDX | SDHCI_INT_DAT_TIMEOUT | SDHCI_INT_DAT_CRC | SDHCI_INT_DAT_END_BIT | SDHCI_INT_ADMA_ERR);
++
++	sdhci_write_1(sc, SDHCI_POWER, SDHCI_POWER_ON | SDHCI_POWER_330);
++
++	reg = sdhci_read_1(sc, SDHCI_HOSTCTL);
++	reg &= ~0x3;
++	reg |= 0x2;
++	sdhci_write_1(sc, SDHCI_HOSTCTL, reg);
++
++	if (sc->sc_capabilities & (1 << 25)) {
++		sc->sc_adma_table = malloc(32 * sizeof(struct sdhci_adma_desc), M_DEVBUF, M_NOWAIT | M_ZERO);
++		if (sc->sc_adma_table == NULL)
++			return ENOMEM;
++
++		error = bus_dmamap_create(sc->sc_dmatag, 32 * sizeof(struct sdhci_adma_desc), 1, 32 * sizeof(struct sdhci_adma_desc), 0, BUS_DMA_NOWAIT, &sc->sc_adma_map);
++		if (error) {
++			free(sc->sc_adma_table, M_DEVBUF);
++			return error;
++		}
++		error = bus_dmamap_load(sc->sc_dmatag, sc->sc_adma_map, sc->sc_adma_table, 32 * sizeof(struct sdhci_adma_desc), NULL, BUS_DMA_NOWAIT);
++		if (error) {
++			bus_dmamap_destroy(sc->sc_dmatag, sc->sc_adma_map);
++			free(sc->sc_adma_table, M_DEVBUF);
++			return error;
++		}
++		sc->sc_adma_phys = sc->sc_adma_map->dm_segs[0].ds_addr;
++		sdhci_write_4(sc, SDHCI_SYSADDR, (uint32_t)sc->sc_adma_phys);
++		sdhci_write_4(sc, SDHCI_SYSADDR + 4, (uint32_t)(sc->sc_adma_phys >> 32));
++
++		reg = sdhci_read_1(sc, SDHCI_HOSTCTL);
++		reg |= (2 << 3);
++		sdhci_write_1(sc, SDHCI_HOSTCTL, reg);
++	}
++
++	sdhci_write_1(sc, SDHCI_TIMEOUT, 0xE);
++
++	reg = sdhci_core_read_4(sc, MSM_CORE_PWRCTL);
++	reg |= MSM_CORE_PWRCTL_BUS_ON | MSM_CORE_PWRCTL_IO_HIGH;
++	sdhci_core_write_4(sc, MSM_CORE_PWRCTL, reg);
++
++	reg = sdhci_core_read_4(sc, MSM_CORE_DLL_CONFIG);
++	reg &= ~(MSM_CORE_DLL_PDN | MSM_CORE_DLL_RST);
++	reg |= MSM_CORE_DLL_EN;
++	sdhci_core_write_4(sc, MSM_CORE_DLL_CONFIG, reg);
++	DELAY(5);
++	reg &= ~MSM_CORE_DLL_RST;
++	sdhci_core_write_4(sc, MSM_CORE_DLL_CONFIG, reg);
++	DELAY(5);
++	reg |= MSM_CORE_CK_OUT_EN;
++	sdhci_core_write_4(sc, MSM_CORE_DLL_CONFIG, reg);
++
++	sdhci_core_wait_for_bit(sc, MSM_CORE_DLL_STATUS, MSM_CORE_DLL_LOCK, MSM_CORE_DLL_LOCK, 50);
++
++	sc->sc_initialized = true;
++	return 0;
++}
++
++static int
++sdhci_send_command(struct sdhci_softc *sc, uint32_t cmd, uint32_t arg, uint32_t flags, uint32_t *resp)
++{
++	uint32_t cmd_reg = 0;
++	uint32_t int_status;
++	int error = 0;
++
++	error = sdhci_wait_for_bit(sc, SDHCI_PRESTATE, SDHCI_PRESTATE_CMD_INHIBIT, 0, 100000);
++	if (error)
++		return error;
++
++	sdhci_write_4(sc, SDHCI_NORINTSTS, 0xFFFFFFFF);
++	sdhci_write_4(sc, SDHCI_ERRINTSTS, 0xFFFFFFFF);
++
++	sdhci_write_4(sc, SDHCI_ARG, arg);
++
++	switch (flags & 0x7) {
++	case 0: cmd_reg |= SDHCI_CMD_RESP_NONE; break;
++	case 1: cmd_reg |= SDHCI_CMD_RESP_R1; break;
++	case 2: cmd_reg |= SDHCI_CMD_RESP_R1B; break;
++	case 3: cmd_reg |= SDHCI_CMD_RESP_R2; break;
++	case 4: cmd_reg |= SDHCI_CMD_RESP_R3; break;
++	case 5: cmd_reg |= SDHCI_CMD_RESP_R4; break;
++	case 6: cmd_reg |= SDHCI_CMD_RESP_R5; break;
++	case 7: cmd_reg |= SDHCI_CMD_RESP_R6; break;
++	}
++
++	if (flags & 0x100) cmd_reg |= SDHCI_CMD_CRC;
++	if (flags & 0x200) cmd_reg |= SDHCI_CMD_INDEX;
++	if (flags & 0x400) cmd_reg |= SDHCI_CMD_DATA;
++
++	cmd_reg |= (cmd & 0x3F) << 8;
++
++	sdhci_write_2(sc, SDHCI_CMD, cmd_reg);
++
++	error = sdhci_wait_for_bit(sc, SDHCI_NORINTSTS, SDHCI_INT_CC | SDHCI_INT_ERR, SDHCI_INT_CC, 1000000);
++	if (error) {
++		int_status = sdhci_read_4(sc, SDHCI_NORINTSTS);
++		if (int_status & SDHCI_INT_ERR) {
++			uint32_t err_status = sdhci_read_4(sc, SDHCI_ERRINTSTS);
++			device_printf(sc->sc_dev, "Command error: cmd=%d arg=0x%x err=0x%x\n", cmd, arg, err_status);
++			return EIO;
++		}
++		return ETIMEDOUT;
++	}
++
++	if (resp && (flags & 0x7)) {
++		if ((flags & 0x7) == 3) {
++			resp[0] = sdhci_read_4(sc, SDHCI_RESP);
++			resp[1] = sdhci_read_4(sc, SDHCI_RESP + 4);
++			resp[2] = sdhci_read_4(sc, SDHCI_RESP + 8);
++			resp[3] = sdhci_read_4(sc, SDHCI_RESP + 12);
++		} else {
++			resp[0] = sdhci_read_4(sc, SDHCI_RESP);
++		}
++	}
++
++	if (sdhci_read_4(sc, SDHCI_ERRINTSTS)) {
++		return EIO;
++	}
++
++	return 0;
++}
++
++static int
++sdhci_read_data(struct sdhci_softc *sc, void *buf, size_t len)
++{
++	uint32_t int_status;
++	uint32_t *dst = buf;
++	size_t remaining = len;
++	int error = 0;
++
++	while (remaining > 0) {
++		error = sdhci_wait_for_bit(sc, SDHCI_NORINTSTS, SDHCI_INT_BRR | SDHCI_INT_TC | SDHCI_INT_ERR, SDHCI_INT_BRR, 1000000);
++		if (error) {
++			int_status = sdhci_read_4(sc, SDHCI_NORINTSTS);
++			if (int_status & SDHCI_INT_ERR)
++				return EIO;
++			if (int_status & SDHCI_INT_TC)
++				break;
++			return ETIMEDOUT;
++		}
++
++		uint32_t blksz = sdhci_read_2(sc, SDHCI_BLKSZ) & 0xFFF;
++		uint32_t words = min(blksz / 4, remaining / 4);
++
++		for (uint32_t i = 0; i < words; i++) {
++			*dst++ = sdhci_read_4(sc, SDHCI_DATA);
++		}
++		remaining -= words * 4;
++	}
++
++	error = sdhci_wait_for_bit(sc, SDHCI_NORINTSTS, SDHCI_INT_TC | SDHCI_INT_ERR, SDHCI_INT_TC, 1000000);
++	if (error)
++		return EIO;
++
++	return 0;
++}
++
++static int
++sdhci_read_blocks(struct sdhci_softc *sc, uint32_t lba, uint32_t count, void *buf)
++{
++	uint32_t arg;
++	uint32_t resp[4];
++	int error;
++	bool use_multiblock = (count > 1);
++
++	if (!sc->sc_initialized)
++		return ENXIO;
++
++	sdhci_write_2(sc, SDHCI_BLKSZ, 512);
++	sdhci_write_2(sc, SDHCI_BLKCNT, count);
++
++	if (use_multiblock) {
++		sdhci_write_4(sc, SDHCI_NORINTEN, sdhci_read_4(sc, SDHCI_NORINTEN) | SDHCI_INT_TC);
++	}
++
++	arg = lba;
++	if (sc->sc_ocr & (1 << 30)) {
++	} else {
++		arg *= 512;
++	}
++
++	error = sdhci_send_command(sc, use_multiblock ? 18 : 17, arg,
++	    use_multiblock ? 0x401 : 0x400, resp);
++	if (error)
++		return error;
++
++	if (use_multiblock) {
++		error = sdhci_read_data(sc, buf, count * 512);
++		if (error)
++			return error;
++
++		sdhci_send_command(sc, 12, 0, 0x100, resp);
++	} else {
++		error = sdhci_read_data(sc, buf, 512);
++	}
++
++	return error;
++}
++
++static int
++sdhci_emmc_init(struct sdhci_softc *sc)
++{
++	uint32_t resp[4];
++	int error;
++	int retries;
++
++	error = sdhci_set_clock(sc, M01_EMMC_CLOCK_ID_HZ);
++	if (error)
++		return error;
++
++	DELAY(100000);
++
++	for (retries = 0; retries < 3; retries++) {
++		error = sdhci_send_command(sc, 0, 0, 0, NULL);
++		if (!error)
++			break;
++		DELAY(10000);
++	}
++	if (error)
++		return error;
++
++	sc->sc_ocr = 0x00FF8080;
++	for (retries = 0; retries < 1000; retries++) {
++		error = sdhci_send_command(sc, 1, sc->sc_ocr, 0x104, resp);
++		if (error)
++			return error;
++		if (resp[0] & (1 << 31)) {
++			sc->sc_ocr = resp[0];
++			break;
++		}
++		DELAY(10000);
++	}
++	if (!(sc->sc_ocr & (1 << 31)))
++		return ETIMEDOUT;
++
++	error = sdhci_send_command(sc, 2, 0, 0x103, resp);
++	if (error)
++		return error;
++
++	sc->sc_rca = 0x1234;
++	error = sdhci_send_command(sc, 3, sc->sc_rca << 16, 0x101, resp);
++	if (error)
++		return error;
++
++	error = sdhci_send_command(sc, 9, sc->sc_rca << 16, 0x103, resp);
++	if (error)
++		return error.
++
++	error = sdhci_send_command(sc, 7, sc->sc_rca << 16, 0x101, resp);
++	if (error)
++		return error;
++
++	if (!(sc->sc_ocr & (1 << 30))) {
++		device_printf(sc->sc_dev, "eMMC not in sector mode\n");
++		return ENXIO;
++	}
++
++	error = sdhci_set_clock(sc, 52000000);
++	if (error)
++		return error.
++
++	sc->sc_bus_width = 8;
++	device_printf(sc->sc_dev, "eMMC initialized: RCA=0x%x, OCR=0x%x, bus_width=%d\n", sc->sc_rca, sc->sc_ocr, sc->sc_bus_width);
++
++	return 0;
++}
++
++static int
++sdhci_probe(device_t dev)
++{
++	struct sdhci_softc *sc = device_get_softc(dev);
++	sc->sc_dev = dev;
++
++	sc->sc_bustag_hc = arm_generic_bs_tag;
++	if (bus_space_map(sc->sc_bustag_hc, M01_SDHC1_HC_BASE, M01_SDHC_HC_SIZE, 0, &sc->sc_bushandle_hc)) {
++		device_printf(dev, "Cannot map HC registers\n");
++		return ENXIO;
++	}
++
++	sc->sc_bustag_core = arm_generic_bs_tag;
++	if (bus_space_map(sc->sc_bustag_core, M01_SDHC1_CORE_BASE, M01_SDHC_CORE_SIZE, 0, &sc->sc_bushandle_core)) {
++		bus_space_unmap(sc->sc_bustag_hc, sc->sc_bushandle_hc, M01_SDHC_HC_SIZE);
++		device_printf(dev, "Cannot map core registers\n");
++		return ENXIO.
++	}
++
++	sc->sc_base_hc = M01_SDHC1_HC_BASE;
++	sc->sc_base_core = M01_SDHC1_CORE_BASE;
++	sc->sc_base_cmdq = M01_SDHC1_CMDQ_BASE;
++
++	if (bus_dma_tag_create(bus_get_dma_tag(dev), 1, 0, BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL, 32 * 512, 1, 32 * 512, 0, NULL, NULL, &sc->sc_dmatag)) {
++		bus_space_unmap(sc->sc_bustag_core, sc->sc_bushandle_core, M01_SDHC_CORE_SIZE);
++		bus_space_unmap(sc->sc_bustag_hc, sc->sc_bushandle_hc, M01_SDHC_HC_SIZE);
++		return ENOMEM;
++	}
++
++	sdhci_sc = sc;
++	return 0;
++}
++
++static int
++sdhci_attach(device_t dev)
++{
++	struct sdhci_softc *sc = device_get_softc(dev);
++	int error;
++
++	error = sdhci_init_host(sc);
++	if (error) {
++		device_printf(dev, "Host init failed: %d\n", error);
++		return error;
++	}
++
++	error = sdhci_emmc_init(sc);
++	if (error) {
++		device_printf(dev, "eMMC init failed: %d\n", error);
++		return error;
++	}
++
++	sc->sc_disk = disk_alloc();
++	sc->sc_disk->d_dev = dev;
++	sc->sc_disk->d_open = sdhci_open;
++	sc->sc_disk->d_close = sdhci_close;
++	sc->sc_disk->d_strategy = sdhci_strategy;
++	sc->sc_disk->d_ioctl = sdhci_ioctl;
++	sc->sc_disk->d_dump = sdhci_dump;
++	snprintf(sc->sc_disk->d_name, sizeof(sc->sc_disk->d_name), "sdhci");
++	disk_create(sc->sc_disk, DISK_VERSION);
++
++	device_printf(dev, "SDHCI eMMC attached\n");
++	return 0;
++}
++
++static int
++sdhci_open(struct disk *dp)
++{
++	return 0;
++}
++
++static int
++sdhci_close(struct disk *dp)
++{
++	return 0;
++}
++
++static void
++sdhci_strategy(struct buf *bp)
++{
++	struct sdhci_softc *sc = sdhci_sc;
++	daddr_t blkno = bp->b_blkno;
++	uint32_t count = bp->b_bcount / 512;
++	int error;
++
++	if (bp->b_flags & B_READ) {
++		error = sdhci_read_blocks(sc, blkno, count, bp->b_data);
++		if (error) {
++			bp->b_error = error;
++			bp->b_flags |= B_ERROR;
++		}
++		bp->b_resid = 0;
++	} else {
++		bp->b_error = EROFS;
++		bp->b_flags |= B_ERROR;
++	}
++	biodone(bp);
++}
++
++static int
++sdhci_ioctl(struct disk *dp, u_long cmd, void *data, int fflag, struct proc *p)
++{
++	switch (cmd) {
++	case DIOCGDINFO:
++	case DIOCGPDINFO: {
++		struct disklabel *lp = (struct disklabel *)data;
++		bzero(lp, sizeof(*lp));
++		lp->d_secsize = 512;
++		lp->d_nsectors = 1;
++		lp->d_ntracks = 1;
++		lp->d_ncylinders = 1;
++		lp->d_secpercyl = 1;
++		lp->d_secperunit = 1024 * 1024;
++		lp->d_rpm = 3600;
++		lp->d_interleave = 1;
++		lp->d_flags = 0;
++		lp->d_type = DTYPE_SCSI;
++		strncpy(lp->d_typename, "eMMC", 16);
++		strncpy(lp->d_packname, "M01", 16);
++		lp->d_magic = DISKMAGIC;
++		lp->d_magic2 = DISKMAGIC;
++		lp->d_checksum = dkcksum(lp);
++		return 0;
++	}
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sdhci_dump(void *arg, void *buf, daddr_t blkno, size_t size)
++{
++	return ENXIO;
++}
++
++static device_method_t sdhci_methods[] = {
++	DEVMETHOD(device_probe, sdhci_probe),
++	DEVMETHOD(device_attach, sdhci_attach),
++	DEVMETHOD(device_detach, bus_generic_detach),
++	{ 0, 0 }
++};
++
++static driver_t sdhci_driver = {
++	"sdhci",
++	sdhci_methods,
++	sizeof(struct sdhci_softc)
++};
++
++DRIVER_MODULE(sdhci, simplebus, sdhci_driver, NULL, NULL);
++MODULE_DEPEND(sdhci, disk, 1, 1, 1);
