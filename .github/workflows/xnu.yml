@@ -34,9 +34,10 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
+    # macos-14 still ships Xcode 15.x (Intel): its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    # Use macos-13 or macos-14 (Intel) - not macos-14-arm64
+    runs-on: macos-13
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
